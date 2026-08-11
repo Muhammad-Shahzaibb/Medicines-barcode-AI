@@ -35,7 +35,8 @@ class MedicineRecord:
             1
             for value in (
                 self.gtin,
-                self.batch_no or self.lot,
+                self.batch_no,
+                self.lot,
                 self.mfg_date,
                 self.exp_date,
                 self.serial_number,

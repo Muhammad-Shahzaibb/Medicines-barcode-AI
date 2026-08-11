@@ -17,14 +17,14 @@ st.set_page_config(
 )
 
 st.title("Medicine Barcode Extractor")
-st.caption("Vision AI extraction via Groq Llama 4 Scout")
+st.caption("Vision AI extraction via Qwen3-VL-32B (vLLM)")
 
 with st.sidebar:
     st.header("Settings")
-    if not os.getenv("GROQ_API_KEY"):
-        st.error("Set GROQ_API_KEY in your .env file.")
-    else:
-        st.success("GROQ_API_KEY loaded")
+    llm_base_url = os.getenv("LLM_BASE_URL", "http://101.44.222.84:8000/v1")
+    llm_model = os.getenv("LLM_MODEL") or "(auto from /v1/models)"
+    st.success(f"LLM: {llm_base_url}")
+    st.caption(f"Model: {llm_model}")
 
 uploaded = st.file_uploader(
     "Upload medicine packaging image",

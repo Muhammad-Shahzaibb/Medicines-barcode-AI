@@ -63,10 +63,12 @@ def _assign_field(record: MedicineRecord, label: str, value: str) -> None:
     if label == "gtin":
         record.gtin = normalize_gtin(value)
         record.source_fields["gtin"] = "ocr"
-    elif label in {"batch", "lot"}:
-        record.batch_no = record.batch_no or value
-        record.lot = record.lot or value
-        record.source_fields["batch_no" if label == "batch" else "lot"] = "ocr"
+    elif label == "batch":
+        record.batch_no = value
+        record.source_fields["batch_no"] = "ocr"
+    elif label == "lot":
+        record.lot = value
+        record.source_fields["lot"] = "ocr"
     elif label == "mfg":
         record.mfg_date = normalize_date(value.split()[0] if " " in value else value)
         record.source_fields["mfg_date"] = "ocr"

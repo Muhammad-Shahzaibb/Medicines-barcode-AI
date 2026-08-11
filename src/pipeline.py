@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 
-from src.llm_extractor import extract_with_groq
+from src.llm_extractor import extract_with_vision_llm
 from src.models import ExtractionResult, MedicineRecord
 
 
@@ -16,16 +16,7 @@ def _harmonize_multi_unit(records: list[MedicineRecord]) -> list[MedicineRecord]
             continue
         most_common = Counter(values).most_common(1)[0][0]
         for record in records:
-            if field == "lot":
-                record.lot = most_common
-                if not record.batch_no:
-                    record.batch_no = most_common
-            elif field == "batch_no":
-                record.batch_no = most_common
-                if not record.lot:
-                    record.lot = most_common
-            else:
-                setattr(record, field, most_common)
+            setattr(record, field, most_common)
 
     return records
 
@@ -38,7 +29,7 @@ def process_image(
     result = ExtractionResult(source_image=source_name)
 
     try:
-        records = extract_with_groq(image_bytes, mime=mime)
+        records = extract_with_vision_llm(image_bytes, mime=mime)
         result.pipeline_steps.append(f"vision_llm: extracted {len(records)} medicine(s)")
         result.medicines = _harmonize_multi_unit(records)
     except Exception as exc:

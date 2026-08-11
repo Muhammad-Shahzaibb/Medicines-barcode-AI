@@ -13,7 +13,7 @@ load_dotenv()
 
 app = FastAPI(
     title="Medicine Barcode Extractor API",
-    description="Upload a medicine packaging image to extract traceability data via Groq vision AI.",
+    description="Upload a medicine packaging image to extract traceability data via vision LLM.",
     version="1.0.0",
 )
 
@@ -50,9 +50,6 @@ def health() -> dict[str, str]:
 
 @app.post("/extract")
 async def extract_medicines(file: UploadFile = File(...)) -> dict:
-    if not os.getenv("GROQ_API_KEY"):
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not set in environment.")
-
     if not file.filename:
         raise HTTPException(status_code=400, detail="Uploaded file must have a filename.")
 

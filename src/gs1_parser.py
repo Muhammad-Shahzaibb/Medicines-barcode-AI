@@ -118,9 +118,8 @@ def parse_gs1(raw: str) -> MedicineRecord:
             record.gtin = normalize_gtin(value)
             record.source_fields["gtin"] = "barcode"
         elif ai == "10":
-            record.batch_no = value
             record.lot = value
-            record.source_fields["batch_no"] = "barcode"
+            record.source_fields["lot"] = "barcode"
         elif ai == "11":
             record.mfg_date = normalize_date(value)
             record.source_fields["mfg_date"] = "barcode"
