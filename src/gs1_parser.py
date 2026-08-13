@@ -115,7 +115,7 @@ def parse_gs1(raw: str) -> MedicineRecord:
     for ai, value in _tokenize(raw):
         value = value.strip()
         if ai == "01":
-            record.gtin = normalize_gtin(value)
+            record.gtin = normalize_gtin(value, require_check=False)
             record.source_fields["gtin"] = "barcode"
         elif ai == "10":
             record.lot = value

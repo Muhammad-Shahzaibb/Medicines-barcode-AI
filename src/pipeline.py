@@ -16,7 +16,8 @@ def _harmonize_multi_unit(records: list[MedicineRecord]) -> list[MedicineRecord]
             continue
         most_common = Counter(values).most_common(1)[0][0]
         for record in records:
-            setattr(record, field, most_common)
+            if getattr(record, field) is None:
+                setattr(record, field, most_common)
 
     return records
 

@@ -5,18 +5,57 @@ import json
 import os
 import re
 from functools import lru_cache
+from io import BytesIO
 from typing import Any
 
 from openai import OpenAI
+from PIL import Image, ImageOps
 
+from src.gs1_parser import parse_gs1
 from src.models import MedicineRecord
 from src.normalizer import normalize_date, normalize_gtin
 
 DEFAULT_LLM_BASE_URL = "http://101.44.222.84:8000/v1"
 DEFAULT_LLM_API_KEY = "dummy"
+DEFAULT_LLM_SEED = 42
+MAX_IMAGE_SIDE = 1536
+NULL_TOKENS = {
+    "",
+    "null",
+    "none",
+    "n/a",
+    "na",
+    "nil",
+    "-",
+    "--",
+    "unknown",
+    "not found",
+    "not visible",
+    "not present",
+    "unavailable",
+}
+INVALID_FIELD_VALUES = {
+    "STERILE",
+    "STERILER",
+    "EXPIRY",
+    "EXPIRYDATE",
+    "DATE",
+    "MADE",
+    "FRANCE",
+    "CHINA",
+    "UDI",
+    "GTIN",
+    "BATCH",
+    "BATCHCODE",
+    "LOT",
+    "CODE",
+    "MFG",
+    "MFD",
+    "EXP",
+}
 
 SYSTEM_PROMPT = """You are a pharmaceutical and medical-device packaging data extraction expert.
-Analyze label images and return structured traceability data with maximum accuracy.
+Extract ONLY text that is clearly printed on the image. Never guess, infer, or complete missing characters.
 
 OUTPUT — return ONLY valid JSON:
 {
@@ -27,75 +66,107 @@ OUTPUT — return ONLY valid JSON:
       "lot": string or null,
       "mfg_date": string or null,
       "exp_date": string or null,
-      "serial_number": string or null
+      "serial_number": string or null,
+      "gs1_text": string or null,
+      "visible_text": [string]
     }
   ]
 }
 
+ANTI-HALLUCINATION (highest priority):
+1. If a field is not clearly printed, return null. Blurry, cut-off, glare-obscured, or uncertain text → null.
+2. Do not invent digits, leading zeros, dates, GTINs, serials, batch, or lot values.
+3. Do not copy a value into another field. CAT/REF/product code is not GTIN. LOT is not batch unless a batch label is also present. LOT is not serial. LOT is not a date field.
+4. Do not use manufacturer names, addresses, sizes, quantities, websites, PL/license numbers, or HIBC codes as any output field.
+5. If you cannot read a character with certainty (0 vs O, 1 vs I, 5 vs S), return null for that whole field.
+
 CORE RULES:
-1. One object per distinct medicine/unit label. Multiple boxes in one photo → multiple objects.
-2. Use null when a field is genuinely absent — never guess.
-3. Normalize dates to YYYY-MM-DD. Month-year only → use 1st of month (e.g. 09-2026 → 2026-09-01).
-4. batch_no and lot are separate fields — never copy one into the other.
-5. Use null for batch_no or lot when that specific label/value is not visible on the packaging.
-6. Read rotated/vertical text carefully. Preserve leading zeros (00603113 not 70603113).
+1. One object per distinct medicine/unit label visible in the photo.
+2. Normalize dates to YYYY-MM-DD. Month-year only → 1st of month (09-2026 → 2026-09-01). Keep the printed year/month; do not invent a day other than 01 when day is absent.
+3. batch_no and lot are separate. Fill a field only if that label (or GS1 AI) is visible.
+4. Read rotated/vertical text. Preserve leading zeros exactly as printed.
 
-GTIN — ONLY use values explicitly labeled or encoded as product identifier:
-  GTIN, GTN, EAN, UDI, PC: (Product Code), (01), 14-digit code under barcode.
-  Do NOT use: CAT NO, REF, LOT, SN/Serial, HIBC codes (+H78476H0L), or license numbers (PL xxxxx).
-  HIBC barcodes start with "+" — that is NOT a GTIN. Leave gtin null if only HIBC is visible.
+GTIN — extract when a product identifier is clearly printed:
+  - GS1 `(01)` followed by 8–14 digits, even in small/thin font above a 2D barcode.
+    Example: (01)16975486451862 → gtin=16975486451862. Always copy this when present.
+  - Labels: GTIN, GTN, EAN, or a 13/14-digit numeric code directly under a product barcode.
+  NOT GTIN: CAT NO, REF, catalog/SKU (KM-DM033, KM-QP020), HIBC codes starting with +, PL/license numbers,
+    or alphanumeric UDI text such as 697548645101PP. The UDI box is not the GTIN unless it is a numeric (01) value.
+  If only HIBC, CAT/REF, or alphanumeric UDI is visible and there is no (01)/GTIN/EAN, gtin = null.
 
-BATCH (batch_no): Batch, BNO, B.NO, BN, Batch No, Batch Number.
-  Put the value in batch_no only. If no batch label is visible, set batch_no to null.
+BATCH (batch_no): only Batch, BNO, B.NO, BN, B/N, Batch No, Batch Number, Batch Code.
+  If that label is absent, batch_no = null even when a LOT value exists.
 
-LOT (lot): LOT, Lot, Lot No, LOT NO., Lote, (10), [LOT] box symbol.
-  Put the value in lot only. If no lot label is visible, set lot to null.
-  Lot numbers can be numeric (00603113, KM2503173) or alphanumeric (P2500043).
-  An 8-digit YYYYMMDD beside [LOT] is a lot number, NOT a serial number.
-  Do NOT duplicate the same value into both batch_no and lot unless both labels appear with the same value.
+LOT (lot): only LOT, Lot, Lot No, LOT NO., Lote, (10), [LOT] box symbol.
+  If that label is absent, lot = null even when a Batch/BN value exists.
+  If BOTH LOT and Batch/Batch Code labels point to the same printed value, set both to that value.
+  An 8-digit YYYYMMDD beside [LOT] is a lot number, NOT mfg_date and NOT serial_number.
 
-SERIAL: SN, SNO, Serial, (21) — unique per unit. On multi-box photos each box has a different SN.
-  Do NOT put expiry dates or lot numbers in serial_number.
-  12-digit numbers labeled SN: are serial numbers, NOT GTIN.
+SERIAL: only SN, SNO, Serial, (21). Unique per unit.
+  Do not put expiry, lot, batch, REF, or GTIN into serial_number.
 
-MFG DATE — factory/building icon (ISO 15223) OR text: MFG, MFD, MD, MFG.DATE, (11), P:
-EXP DATE — hourglass icon (ISO 15223) OR text: EXP, EXP.DATE, CAD, (17)
-  CRITICAL: factory icon date = mfg_date. hourglass icon date = exp_date. Never swap them.
-  When three 8-digit dates appear with symbols: [LOT]=lot, factory=mfg, hourglass=exp.
+MFG DATE: factory/building icon (ISO 15223) OR MFG, MFD, MD, MFG.DATE, PRO, (11), P:
+EXP DATE: hourglass icon (ISO 15223) OR EXP, EXP.DATE, EXPIRY DATE, CAD, (17)
+  Factory icon = mfg_date. Hourglass = exp_date. Never swap them.
+  Do not derive mfg_date from a lot/batch number even if that number looks like a date.
 
-DATE FORMATS: YYYYMMDD, YYMMDD, YYYY-MM, YYYY-MM-DD, MM/YYYY, MM-YYYY, MM YYYY, DD/MM/YYYY.
-  Examples: 20250415 → 2025-04-15 | 2029-04 → 2029-04-01 | 12/2026 → 2026-12-01 | 09-2026 → 2026-09-01
+DATE FORMATS: YYYYMMDD, YYMMDD, YYYY-MM, YYYY-MM-DD, MM/YYYY, MM-YYYY, MM YYYY, DD/MM/YYYY, YYYY MM DD.
+  20250415 → 2025-04-15 | 2029-04 → 2029-04-01 | 12/2026 → 2026-12-01 | 09-2026 → 2026-09-01 | 07 - 2023 → 2023-07-01 | 30/11/2028 → 2028-11-30
 
-GS1 HUMAN-READABLE (when printed near barcode):
-  (01)=GTIN (02)=(10)=lot (11)=mfg YYMMDD (17)=exp YYMMDD (21)=serial
+GS1 HUMAN-READABLE — copy these strings into gs1_text EXACTLY as printed, including parentheses:
+  (01)=GTIN  (10)=lot  (11)=mfg YYMMDD  (17)=exp YYMMDD  (21)=serial
+  Example gs1_text: "(01)06975486453029 (11)250415(17)300414(10)KM2503173"
+  If no parenthesized GS1 text is visible, gs1_text = null. Do not invent AIs or digits.
 
-MULTI-BOX IMAGES: All boxes often share the same PC:/GTIN, Lot, and EXP but each has a unique SN.
-  Return one object per visible box with its own serial_number.
+VISIBLE TEXT — list the exact printed lines/values you used (LOT/BN/MFG/EXP/GS1/SN/GTIN). Copy characters exactly. Do not add lines that are not in the image.
 
-DENSE LABELS: Read the full label including text above/below barcodes. Extract GTIN from (01) even on crowded labels.
+MULTI-BOX: shared PC/GTIN/Lot/EXP is allowed only if printed on each box or clearly the same pack family; each box keeps its own SN. Do not invent extra boxes.
 
-ACCURACY CHECKLIST before responding:
+ACCURACY CHECKLIST:
+- Prefer null over a guessed character
 - 0 vs 7, 0 vs O, 1 vs I, 5 vs S, 8 vs B
-- Leading zeros in lot numbers
-- Serial numbers are not dates
-- GTIN is not confused with serial number on multi-unit photos
+- Leading zeros preserved
+- Serial is not a date, lot, or GTIN
+- batch_no is null when only LOT is printed
+- lot is null when only BN/Batch is printed
 - mfg_date and exp_date are not swapped
 """
 
-RETRY_PROMPT = """The previous extraction failed or was incomplete.
-Re-examine this image very carefully. Pay special attention to:
-- Rotated/vertical text (LOT, EXP on bottle labels)
-- ISO symbols: factory icon = mfg_date, hourglass = exp_date
-- PC: label = GTIN (product code), SN: = serial_number (unique per box)
-- (01) GTIN and (10)/(11)/(17) GS1 strings on crowded labels
-- Leading zeros in lot numbers
-- HIBC codes starting with + are NOT gtin
-Return JSON only with the medicines array."""
+USER_TEXT = (
+    "Extract traceability fields that are clearly printed on this image. "
+    "First copy the exact LOT/BATCH/MFG/EXP/GTIN/SN/GS1 lines into visible_text. "
+    "Copy every visible GS1 string such as (01)/(10)/(11)/(17)/(21) into gs1_text exactly. "
+    "Every output field must appear in visible_text or gs1_text. If a field is missing or unreadable, return null. "
+    "Do not guess. Return JSON only."
+)
+
+RETRY_PROMPT = (
+    "The previous response was not valid JSON or contained no records. "
+    "Read only clearly visible printed values. Use null for missing fields. "
+    "Do not guess. Return JSON only with the medicines array."
+)
 
 
 def _image_to_data_url(image_bytes: bytes, mime: str = "image/jpeg") -> str:
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return f"data:{mime};base64,{encoded}"
+
+
+def _prepare_image(image_bytes: bytes, mime: str) -> tuple[bytes, str]:
+    image = Image.open(BytesIO(image_bytes))
+    image = ImageOps.exif_transpose(image) or image
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    width, height = image.size
+    longest = max(width, height)
+    if longest > MAX_IMAGE_SIDE:
+        scale = MAX_IMAGE_SIDE / longest
+        image = image.resize((max(1, int(width * scale)), max(1, int(height * scale))), Image.Resampling.LANCZOS)
+
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=95, optimize=True)
+    return buffer.getvalue(), "image/jpeg"
 
 
 def _parse_llm_json(content: str) -> dict[str, Any]:
@@ -106,54 +177,196 @@ def _parse_llm_json(content: str) -> dict[str, Any]:
     return json.loads(text)
 
 
+def _clean_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text.lower() in NULL_TOKENS:
+        return None
+    return text
+
+
 def _looks_like_date(value: str) -> bool:
     digits = re.sub(r"\D", "", value)
     if len(digits) == 8:
         year = int(digits[:4])
         return 1990 <= year <= 2045
+    if len(digits) == 6:
+        year = 2000 + int(digits[:2])
+        return 1990 <= year <= 2045
     return False
 
 
-def _repair_record(item: dict[str, Any]) -> dict[str, Any]:
-    sn = str(item["serial_number"]).strip() if item.get("serial_number") else None
-    batch = str(item.get("batch_no") or item.get("batch") or "").strip() or None
-    lot = str(item.get("lot") or "").strip() or None
-    gtin = str(item["gtin"]).strip() if item.get("gtin") else None
+def _evidence_text(item: dict[str, Any]) -> str:
+    parts: list[str] = []
+    visible = item.get("visible_text") or item.get("evidence")
+    if isinstance(visible, str):
+        parts.append(visible)
+    elif isinstance(visible, list):
+        parts.extend(str(line) for line in visible if line)
+    gs1 = item.get("gs1_text") or item.get("gs1")
+    if isinstance(gs1, list):
+        parts.extend(str(part) for part in gs1 if part)
+    elif gs1:
+        parts.append(str(gs1))
+    return " ".join(parts)
 
-    if sn and _looks_like_date(sn) and not item.get("exp_date"):
-        item["exp_date"] = normalize_date(sn)
-        item["serial_number"] = None
+
+def _compact(text: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", text.upper())
+
+
+def _supported_by_evidence(value: str, evidence: str, is_date: bool = False) -> bool:
+    if not evidence or not value:
+        return True
+    compact_evidence = _compact(evidence)
+    if is_date:
+        normalized = normalize_date(value)
+        if not normalized:
+            return False
+        year, month, day = normalized.split("-")
+        candidates = (
+            f"{year}{month}{day}",
+            f"{year}{month}",
+            f"{month}{year}",
+            f"{year[2:]}{month}{day}",
+            f"{day}{month}{year}",
+            f"{month}{day}{year}",
+        )
+        return any(candidate in compact_evidence for candidate in candidates)
+    return _compact(value) in compact_evidence
+
+
+def _extract_labeled_value(evidence: str, patterns: tuple[str, ...]) -> str | None:
+    for pattern in patterns:
+        match = re.search(pattern, evidence, re.I)
+        if not match:
+            continue
+        value = match.group(1).strip(" .:-")
+        if value and _compact(value) not in INVALID_FIELD_VALUES:
+            return value
+    return None
+
+
+def _merge_gs1_text(item: dict[str, Any]) -> dict[str, Any]:
+    raw = item.get("gs1_text") or item.get("gs1")
+    if isinstance(raw, list):
+        raw = " ".join(str(part) for part in raw if part)
+    raw = _clean_str(raw)
+    if not raw or not re.search(r"\(\d{2,4}\)", raw):
+        return item
+
+    parsed = parse_gs1(raw)
+    if parsed.gtin and not _clean_str(item.get("gtin")):
+        item["gtin"] = parsed.gtin
+    if parsed.lot and not _clean_str(item.get("lot")):
+        item["lot"] = parsed.lot
+    if parsed.mfg_date and not _clean_str(item.get("mfg_date")):
+        item["mfg_date"] = parsed.mfg_date
+    if parsed.exp_date and not _clean_str(item.get("exp_date")):
+        item["exp_date"] = parsed.exp_date
+    if parsed.serial_number and not _clean_str(item.get("serial_number")):
+        item["serial_number"] = parsed.serial_number
+    return item
+
+
+def _repair_record(item: dict[str, Any]) -> dict[str, Any]:
+    item = _merge_gs1_text(item)
+    evidence = _evidence_text(item)
+    sn = _clean_str(item.get("serial_number"))
+    batch = _clean_str(item.get("batch_no") or item.get("batch"))
+    lot = _clean_str(item.get("lot"))
+    gtin = _clean_str(item.get("gtin"))
+    mfg = _clean_str(item.get("mfg_date"))
+    exp = _clean_str(item.get("exp_date"))
+
+    if evidence:
+        if gtin and not _supported_by_evidence(gtin, evidence):
+            gtin = None
+        if batch and not _supported_by_evidence(batch, evidence):
+            batch = None
+        if lot and not _supported_by_evidence(lot, evidence):
+            lot = None
+        if sn and not _supported_by_evidence(sn, evidence):
+            sn = None
+        if mfg and not _supported_by_evidence(mfg, evidence, is_date=True):
+            mfg = None
+        if exp and not _supported_by_evidence(exp, evidence, is_date=True):
+            exp = None
+
+        if not lot:
+            lot = _extract_labeled_value(
+                evidence,
+                (r"\bLOT(?:\s*NO\.?)?[#:\s.]*([A-Z0-9][A-Z0-9\-/]{2,})",),
+            )
+        if not batch:
+            batch = _extract_labeled_value(
+                evidence,
+                (
+                    r"\bB/?N\s*[#:=]\s*([A-Z0-9][A-Z0-9\-/]{2,})",
+                    r"\bB\.?N\.?O?\.?\s*[#:=]\s*([A-Z0-9][A-Z0-9\-/]{2,})",
+                    r"\bBATCH(?:\s*(?:NO\.?|NUMBER))?\s*[#:=]\s*([A-Z0-9][A-Z0-9\-/]{2,})",
+                ),
+            )
+        if not exp:
+            exp = _extract_labeled_value(
+                evidence,
+                (
+                    r"\bEXP(?:IRY)?(?:\s*DATE)?[#:\s.]*([0-9]{1,4}\s*[-/]\s*[0-9]{1,4}(?:\s*[-/]\s*[0-9]{2,4})?)",
+                    r"\bCAD[#:\s.]*([0-9]{1,4}\s*[-/]\s*[0-9]{1,4}(?:\s*[-/]\s*[0-9]{2,4})?)",
+                ),
+            )
+        if not mfg:
+            mfg = _extract_labeled_value(
+                evidence,
+                (
+                    r"\bMFG(?:\.?\s*DATE)?[#:\s.]*([0-9]{1,4}\s*[-/]\s*[0-9]{1,4}(?:\s*[-/]\s*[0-9]{2,4})?)",
+                    r"\bMFD[#:\s.]*([0-9]{1,4}\s*[-/]\s*[0-9]{1,4}(?:\s*[-/]\s*[0-9]{2,4})?)",
+                    r"\bPRO[#:\s.]*([0-9]{1,4}\s*[-/]\s*[0-9]{1,4}(?:\s*[-/]\s*[0-9]{2,4})?)",
+                ),
+            )
+        if not gtin:
+            ai_gtin = re.search(r"\(01\)\s*(\d{8,14})", evidence)
+            if ai_gtin:
+                gtin = ai_gtin.group(1)
+        if (
+            lot
+            and not batch
+            and re.search(r"\bbatch\s*code\b", evidence, re.I)
+            and _supported_by_evidence(lot, evidence)
+        ):
+            batch = lot
+
+    if sn and _looks_like_date(sn):
+        sn = None
 
     if sn and batch and sn == batch:
-        item["serial_number"] = None
+        sn = None
     if sn and lot and sn == lot:
-        item["serial_number"] = None
+        sn = None
+    if gtin and sn and re.sub(r"\D", "", gtin) == re.sub(r"\D", "", sn):
+        sn = None
 
-    if gtin:
-        gtin_digits = re.sub(r"\D", "", gtin)
-        if len(gtin_digits) == 12 and not gtin_digits.startswith("0"):
-            if item.get("serial_number") is None:
-                item["serial_number"] = gtin_digits
-            item["gtin"] = None
+    if gtin and gtin.startswith("+"):
+        gtin = None
+    if batch and _compact(batch) in INVALID_FIELD_VALUES:
+        batch = None
+    if lot and _compact(lot) in INVALID_FIELD_VALUES:
+        lot = None
 
-    mfg = item.get("mfg_date")
-    exp = item.get("exp_date")
-    if mfg and exp:
-        mfg_n = normalize_date(str(mfg))
-        exp_n = normalize_date(str(exp))
-        if mfg_n and exp_n and mfg_n > exp_n:
-            item["mfg_date"], item["exp_date"] = exp_n, mfg_n
+    mfg_n = normalize_date(mfg) if mfg else None
+    exp_n = normalize_date(exp) if exp else None
+    if mfg_n and exp_n and mfg_n > exp_n:
+        mfg_n, exp_n = exp_n, mfg_n
+    if mfg_n and exp_n and mfg_n == exp_n:
+        mfg_n = None
 
-    for date_candidate in (batch, lot):
-        if date_candidate and _looks_like_date(date_candidate) and item.get("exp_date") and not item.get("mfg_date"):
-            candidate_date = normalize_date(date_candidate)
-            exp_date = normalize_date(str(item["exp_date"]))
-            if candidate_date and exp_date and candidate_date < exp_date:
-                item["mfg_date"] = candidate_date
-                break
-
+    item["serial_number"] = sn
     item["batch_no"] = batch
     item["lot"] = lot
+    item["gtin"] = gtin
+    item["mfg_date"] = mfg_n
+    item["exp_date"] = exp_n
     return item
 
 
@@ -161,37 +374,39 @@ def _record_from_dict(item: dict[str, Any]) -> MedicineRecord:
     item = _repair_record(item)
     batch = item.get("batch_no")
     lot = item.get("lot")
+    gtin = normalize_gtin(str(item["gtin"]), require_check=False) if item.get("gtin") else None
     filled = sum(
         1
-        for v in (item.get("gtin"), batch, lot, item.get("mfg_date"), item.get("exp_date"), item.get("serial_number"))
+        for v in (gtin, batch, lot, item.get("mfg_date"), item.get("exp_date"), item.get("serial_number"))
         if v
     )
     return MedicineRecord(
-        gtin=normalize_gtin(str(item["gtin"])) if item.get("gtin") else None,
+        gtin=gtin,
         batch_no=str(batch) if batch else None,
         lot=str(lot) if lot else None,
-        mfg_date=normalize_date(str(item["mfg_date"])) if item.get("mfg_date") else None,
-        exp_date=normalize_date(str(item["exp_date"])) if item.get("exp_date") else None,
+        mfg_date=item.get("mfg_date"),
+        exp_date=item.get("exp_date"),
         serial_number=str(item["serial_number"]) if item.get("serial_number") else None,
         extraction_method="vision_llm",
         confidence=min(0.95, 0.5 + 0.08 * filled),
         source_fields={
             k: "llm"
             for k in ("gtin", "batch_no", "lot", "mfg_date", "exp_date", "serial_number")
-            if item.get(k)
+            if (k == "gtin" and gtin) or (k != "gtin" and item.get(k))
         },
     )
 
 
-def _get_llm_settings() -> tuple[str, str, str | None]:
+def _get_llm_settings() -> tuple[str, str, str | None, int]:
     base_url = os.getenv("LLM_BASE_URL", DEFAULT_LLM_BASE_URL).rstrip("/")
     api_key = os.getenv("LLM_API_KEY", DEFAULT_LLM_API_KEY)
     model = os.getenv("LLM_MODEL") or None
-    return base_url, api_key, model
+    seed = int(os.getenv("LLM_SEED", str(DEFAULT_LLM_SEED)))
+    return base_url, api_key, model, seed
 
 
 def _create_client() -> OpenAI:
-    base_url, api_key, _ = _get_llm_settings()
+    base_url, api_key, _, _ = _get_llm_settings()
     return OpenAI(base_url=base_url, api_key=api_key)
 
 
@@ -207,25 +422,48 @@ def _resolve_model(base_url: str, api_key: str, configured_model: str | None) ->
     return models.data[0].id
 
 
-def _call_vision_llm(client: OpenAI, model: str, image_bytes: bytes, mime: str, user_text: str) -> dict[str, Any]:
-    completion = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_text},
-                    {"type": "image_url", "image_url": {"url": _image_to_data_url(image_bytes, mime)}},
-                ],
-            },
-        ],
-        temperature=0,
-        max_tokens=4096,
-        response_format={"type": "json_object"},
-    )
+def _call_vision_llm(
+    client: OpenAI,
+    model: str,
+    image_bytes: bytes,
+    mime: str,
+    user_text: str,
+    seed: int,
+) -> dict[str, Any]:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": _image_to_data_url(image_bytes, mime)}},
+            ],
+        },
+    ]
+    request = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0,
+        "top_p": 1,
+        "max_tokens": 2048,
+        "seed": seed,
+        "response_format": {"type": "json_object"},
+        "extra_body": {
+            "seed": seed,
+            "top_k": 1,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    }
+    try:
+        completion = client.chat.completions.create(**request)
+    except Exception:
+        request.pop("extra_body", None)
+        completion = client.chat.completions.create(**request)
     content = completion.choices[0].message.content or "{}"
-    return _parse_llm_json(content)
+    try:
+        return _parse_llm_json(content)
+    except json.JSONDecodeError:
+        return {}
 
 
 def _payload_to_records(payload: dict[str, Any]) -> list[MedicineRecord]:
@@ -235,42 +473,22 @@ def _payload_to_records(payload: dict[str, Any]) -> list[MedicineRecord]:
     return [_record_from_dict(item) for item in medicines if isinstance(item, dict)]
 
 
-def _needs_retry(records: list[MedicineRecord]) -> bool:
-    if not records:
-        return True
-    for record in records:
-        if record.serial_number and _looks_like_date(record.serial_number):
-            return True
-        if record.gtin and record.serial_number and re.sub(r"\D", "", record.gtin) == re.sub(
-            r"\D", "", record.serial_number
-        ):
-            return True
-        if record.mfg_date and record.exp_date and record.mfg_date > record.exp_date:
-            return True
-    return False
-
-
 def extract_with_vision_llm(image_bytes: bytes, mime: str = "image/jpeg") -> list[MedicineRecord]:
-    base_url, api_key, configured_model = _get_llm_settings()
+    base_url, api_key, configured_model, seed = _get_llm_settings()
     if not base_url:
         raise ValueError("LLM_BASE_URL is not set in environment.")
     if not api_key:
         raise ValueError("LLM_API_KEY is not set in environment.")
 
+    image_bytes, mime = _prepare_image(image_bytes, mime)
     client = _create_client()
     model = _resolve_model(base_url, api_key, configured_model)
-    user_text = (
-        "Extract all medicine traceability records from this image. "
-        "Read every label, symbol, barcode, and rotated text. Return JSON only."
-    )
 
-    payload = _call_vision_llm(client, model, image_bytes, mime, user_text)
+    payload = _call_vision_llm(client, model, image_bytes, mime, USER_TEXT, seed)
     records = _payload_to_records(payload)
 
-    if _needs_retry(records):
-        retry_payload = _call_vision_llm(client, model, image_bytes, mime, RETRY_PROMPT)
-        retry_records = _payload_to_records(retry_payload)
-        if len(retry_records) >= len(records):
-            records = retry_records
+    if not records:
+        retry_payload = _call_vision_llm(client, model, image_bytes, mime, RETRY_PROMPT, seed)
+        records = _payload_to_records(retry_payload)
 
     return records
