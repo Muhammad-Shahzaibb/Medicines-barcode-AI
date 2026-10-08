@@ -17,9 +17,9 @@ from src.normalizer import normalize_date, normalize_gtin
 
 DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_LLM_API_KEY = ""
-DEFAULT_LLM_MODEL = "gpt-4.5"
+DEFAULT_LLM_MODEL = "gpt-4o"
 DEFAULT_LLM_SEED = 42
-MAX_IMAGE_SIDE = 1536
+MAX_IMAGE_SIDE = 2048
 NULL_TOKENS = {
     "",
     "null",
@@ -44,6 +44,11 @@ INVALID_FIELD_VALUES = {
     "MADE",
     "FRANCE",
     "CHINA",
+    "ITALY",
+    "INDIA",
+    "SPAIN",
+    "KSA",
+    "GERMANY",
     "UDI",
     "GTIN",
     "BATCH",
@@ -53,12 +58,15 @@ INVALID_FIELD_VALUES = {
     "MFG",
     "MFD",
     "EXP",
+    "REF",
+    "SIZE",
 }
 
 SYSTEM_PROMPT = """You are a pharmaceutical and medical-device packaging data extraction expert.
-Extract ONLY text that is clearly printed on the image. Never guess, infer, or complete missing characters.
+Your task: scan EVERY label, sticker, and printed area in the image and return one JSON object per distinct product label.
+Extract ONLY text clearly visible in the image. Never invent, complete, or guess characters.
 
-OUTPUT — return ONLY valid JSON:
+OUTPUT — return ONLY valid JSON, no markdown fences:
 {
   "medicines": [
     {
@@ -74,77 +82,120 @@ OUTPUT — return ONLY valid JSON:
   ]
 }
 
-ANTI-HALLUCINATION (highest priority):
-1. If a field is not clearly printed, return null. Blurry, cut-off, glare-obscured, or uncertain text → null.
-2. Do not invent digits, leading zeros, dates, GTINs, serials, batch, or lot values.
-3. Do not copy a value into another field. CAT/REF/product code is not GTIN. LOT is not batch unless a batch label is also present. LOT is not serial. LOT is not a date field.
-4. Do not use manufacturer names, addresses, sizes, quantities, websites, PL/license numbers, or HIBC codes as any output field.
-5. If you cannot read a character with certainty (0 vs O, 1 vs I, 5 vs S), return null for that whole field.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MULTI-LABEL DETECTION (critical)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Scan the ENTIRE image for separate product labels — boxes, bags, shelf labels, stickers.
+- If two or more distinct product labels appear (even if identical products), create a separate medicines[] entry for each.
+- A new label starts when you see a new product name, a separate barcode, or a new block of LOT/MFG/EXP fields.
+- Do NOT merge multiple distinct labels into one entry.
 
-CORE RULES:
-1. One object per distinct medicine/unit label visible in the photo.
-2. Normalize dates to YYYY-MM-DD. Month-year only → 1st of month (09-2026 → 2026-09-01). Keep the printed year/month; do not invent a day other than 01 when day is absent.
-3. batch_no and lot are separate. Fill a field only if that label (or GS1 AI) is visible.
-4. Read rotated/vertical text. Preserve leading zeros exactly as printed.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ISO 15223 ICONS (appear WITHOUT text labels)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+These symbols appear as small printed icons — identify them by shape and assign accordingly:
+- FACTORY/MANUFACTURER icon: looks like a small building with a chimney or roof-line (⌂ shape, sometimes drawn as "m̈" wave). This icon means the date next to it is the MANUFACTURE DATE → mfg_date.
+- HOURGLASS/USE-BY icon: looks like an hourglass or sand-timer shape (wide top, narrow middle, wide bottom). This icon means the date next to it is the EXPIRY/USE-BY DATE → exp_date.
+- LOT BOX icon: the word LOT or [LOT] inside a rectangle/box symbol → lot value.
+Never swap factory and hourglass dates. Factory (building) = mfg_date. Hourglass = exp_date.
 
-GTIN — extract when a product identifier is clearly printed:
-  - GS1 `(01)` followed by 8–14 digits, even in small/thin font above a 2D barcode.
-    Example: (01)16975486451862 → gtin=16975486451862. Always copy this when present.
-  - Labels: GTIN, GTN, EAN, or a 13/14-digit numeric code directly under a product barcode.
-  NOT GTIN: CAT NO, REF, catalog/SKU (KM-DM033, KM-QP020), HIBC codes starting with +, PL/license numbers,
-    or alphanumeric UDI text such as 697548645101PP. The UDI box is not the GTIN unless it is a numeric (01) value.
-  If only HIBC, CAT/REF, or alphanumeric UDI is visible and there is no (01)/GTIN/EAN, gtin = null.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FIELD EXTRACTION RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-BATCH (batch_no): only Batch, BNO, B.NO, BN, B/N, Batch No, Batch Number, Batch Code.
-  If that label is absent, batch_no = null even when a LOT value exists.
+GTIN:
+  ✓ GS1 AI (01) followed by 8–14 digits: e.g. (01)06975486453029 → gtin=06975486453029
+  ✓ EAN-13/14 numeric code printed directly below a 1D barcode
+  ✓ Label says: GTIN, GTN, EAN
+  ✗ NOT GTIN: REF, CAT NO, CAT.NO, Ref., Ref #, catalog code (e.g. IT-31, GS051M, KM-DM033), HIBC (+…), alphanumeric UDI
+  ✗ If only REF/CAT/alphanumeric code is visible → gtin = null
 
-LOT (lot): only LOT, Lot, Lot No, LOT NO., Lote, (10), [LOT] box symbol.
-  If that label is absent, lot = null even when a Batch/BN value exists.
-  If BOTH LOT and Batch/Batch Code labels point to the same printed value, set both to that value.
-  An 8-digit YYYYMMDD beside [LOT] is a lot number, NOT mfg_date and NOT serial_number.
+BATCH (batch_no):
+  ✓ Labels: Batch, Batch No, Batch No., Batch Number, Batch Code, BNO, B.NO, BN, B/N, B.N, B.N.
+  ✗ If none of those labels present → batch_no = null (even if LOT exists)
+  SPECIAL: If a [LOT] box symbol has sub-label "Batch Code" printed under it → fill BOTH lot AND batch_no with the same value.
 
-SERIAL: only SN, SNO, Serial, (21). Unique per unit.
-  Do not put expiry, lot, batch, REF, or GTIN into serial_number.
+LOT (lot):
+  ✓ Labels: LOT, Lot, LOT NO., Lot No, LOT #, Lote, GS1 AI (10), [LOT] box symbol
+  ✗ If none of those labels present → lot = null (even if Batch exists)
+  NOTE: An 8-digit number (YYYYMMDD format) printed beside [LOT] is a LOT NUMBER, not a date.
 
-MFG DATE: factory/building icon (ISO 15223) OR MFG, MFD, MD, MFG.DATE, PRO, (11), P:
-EXP DATE: hourglass icon (ISO 15223) OR EXP, EXP.DATE, EXPIRY DATE, CAD, (17)
-  Factory icon = mfg_date. Hourglass = exp_date. Never swap them.
-  Do not derive mfg_date from a lot/batch number even if that number looks like a date.
+SERIAL (serial_number):
+  ✓ Labels: SN, SNO, S/N, Serial, Serial No, GS1 AI (21)
+  ✗ Do not put lot, batch, date, REF, or GTIN into serial_number
 
-DATE FORMATS: YYYYMMDD, YYMMDD, YYYY-MM, YYYY-MM-DD, MM/YYYY, MM-YYYY, MM YYYY, DD/MM/YYYY, YYYY MM DD.
-  20250415 → 2025-04-15 | 2029-04 → 2029-04-01 | 12/2026 → 2026-12-01 | 09-2026 → 2026-09-01 | 07 - 2023 → 2023-07-01 | 30/11/2028 → 2028-11-30
+MFG DATE (mfg_date) — any of these patterns → manufacturing date:
+  ✓ ISO 15223 factory/building icon + date
+  ✓ Labels: MFG, MFG., MFG DATE, MFG.DATE, MFD, MD, PRO, P:, GS1 AI (11)
+  ✓ Text label "Date of manufacture" or "Manufacturing date"
 
-GS1 HUMAN-READABLE — copy these strings into gs1_text EXACTLY as printed, including parentheses:
-  (01)=GTIN  (10)=lot  (11)=mfg YYMMDD  (17)=exp YYMMDD  (21)=serial
-  Example gs1_text: "(01)06975486453029 (11)250415(17)300414(10)KM2503173"
-  If no parenthesized GS1 text is visible, gs1_text = null. Do not invent AIs or digits.
+EXP DATE (exp_date) — any of these patterns → expiry/use-by date:
+  ✓ ISO 15223 hourglass icon + date
+  ✓ Labels: EXP, EXP., EXP DATE, EXP.DATE, EXPIRY DATE, EXPIRY, Use By, Use-By, CAD, BB, GS1 AI (17)
+  ✓ Text label "Shelf life" followed by a date
 
-VISIBLE TEXT — list the exact printed lines/values you used (LOT/BN/MFG/EXP/GS1/SN/GTIN). Copy characters exactly. Do not add lines that are not in the image.
+NEVER swap mfg_date and exp_date.
+NEVER derive mfg_date from a lot/batch number that resembles a date.
 
-MULTI-BOX: shared PC/GTIN/Lot/EXP is allowed only if printed on each box or clearly the same pack family; each box keeps its own SN. Do not invent extra boxes.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DATE NORMALIZATION → always output YYYY-MM-DD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  20250415       → 2025-04-15
+  250415 (YYMMDD)→ 2025-04-15
+  2024-06        → 2024-06-01
+  07-2023        → 2023-07-01
+  07/2023        → 2023-07-01
+  11.2025        → 2025-11-01
+  30/11/2028     → 2028-11-30
+  2029-01-15     → 2029-01-15 (already normalized)
+  If day is absent, use 01 as the day.
 
-ACCURACY CHECKLIST:
-- Prefer null over a guessed character
-- 0 vs 7, 0 vs O, 1 vs I, 5 vs S, 8 vs B
-- Leading zeros preserved
-- Serial is not a date, lot, or GTIN
-- batch_no is null when only LOT is printed
-- lot is null when only BN/Batch is printed
-- mfg_date and exp_date are not swapped
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GS1 HUMAN-READABLE TEXT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Copy the EXACT printed GS1 string (with parentheses) into gs1_text.
+  Common AIs: (01)=GTIN (10)=Lot (11)=MfgDate YYMMDD (17)=ExpDate YYMMDD (21)=Serial
+  Example: "(01)06975486453029 (11)250415(17)300414(10)KM2503173"
+  This text often appears directly below a 1D barcode as a small-font human-readable string.
+  If the GS1 string gives GTIN/lot/dates that are missing from other fields, fill those fields from it.
+  If no parenthesized GS1 text exists → gs1_text = null.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VISIBLE_TEXT — evidence logging
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  List every printed line/value you used as evidence: LOT, BN, MFG, EXP, GTIN, SN, GS1 string.
+  Copy characters exactly as printed. Do not add text not visible in image.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ANTI-HALLUCINATION RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. Unclear character → null for that whole field. Prefer null over a wrong value.
+  2. Watch carefully: 0 vs O, 0 vs 7, 1 vs I, 5 vs S, 8 vs B, 6 vs G.
+  3. Preserve leading zeros exactly as printed.
+  4. REF / CAT NO is NOT a GTIN or serial.
+  5. Size, quantity, gauge (18G, 6.5mm, 5.0#) are NOT field values.
+  6. Country names, addresses, manufacturer names, websites are NOT field values.
+  7. Do NOT fill batch_no when only LOT label is present. Do NOT fill lot when only BN/Batch label is present.
+  8. Do NOT put expiry date as mfg_date or vice versa.
 """
 
 USER_TEXT = (
-    "Extract traceability fields that are clearly printed on this image. "
-    "First copy the exact LOT/BATCH/MFG/EXP/GTIN/SN/GS1 lines into visible_text. "
-    "Copy every visible GS1 string such as (01)/(10)/(11)/(17)/(21) into gs1_text exactly. "
-    "Every output field must appear in visible_text or gs1_text. If a field is missing or unreadable, return null. "
-    "Do not guess. Return JSON only."
+    "Examine the ENTIRE image carefully. "
+    "Step 1: Count how many distinct product labels/packages are visible (look for separate barcodes, separate LOT/EXP blocks, separate product names). "
+    "Step 2: For EACH distinct label, extract one medicines[] entry. "
+    "Step 3: Read ALL text including small-font GS1 human-readable strings below barcodes (e.g. '(01)xxx(17)xxx(10)xxx'). "
+    "Step 4: Identify factory-building icons (mfg_date) and hourglass icons (exp_date) — they appear WITHOUT text labels. "
+    "Step 5: Copy exact printed values for LOT/BATCH/MFG/EXP/GTIN/SN into visible_text. "
+    "Step 6: Return ONLY valid JSON — no markdown, no explanation."
 )
 
 RETRY_PROMPT = (
-    "The previous response was not valid JSON or contained no records. "
-    "Read only clearly visible printed values. Use null for missing fields. "
-    "Do not guess. Return JSON only with the medicines array."
+    "Your previous response was invalid or empty. Try again. "
+    "Look at every part of the image including small text near barcodes. "
+    "For factory/building icon → mfg_date. For hourglass icon → exp_date. "
+    "For [LOT] box → lot. For B/N or B.N or Batch → batch_no. "
+    "Use null for fields that are genuinely not visible. Do not guess. "
+    "Return ONLY the JSON object with the medicines array."
 )
 
 
@@ -298,32 +349,38 @@ def _repair_record(item: dict[str, Any]) -> dict[str, Any]:
         if not lot:
             lot = _extract_labeled_value(
                 evidence,
-                (r"\bLOT(?:\s*NO\.?)?[#:\s.]*([A-Z0-9][A-Z0-9\-/]{2,})",),
+                (
+                    r"\bLOT(?:\s*NO\.?)?[#:\s.]*([A-Z0-9][A-Z0-9\-/]{2,})",
+                    r"\bLOT\s*[#:]\s*([A-Z0-9][A-Z0-9\-/]{2,})",
+                ),
             )
         if not batch:
             batch = _extract_labeled_value(
                 evidence,
                 (
-                    r"\bB/?N\s*[#:=]\s*([A-Z0-9][A-Z0-9\-/]{2,})",
+                    r"\bB/?N\s*[#:=\s]\s*([A-Z0-9][A-Z0-9\-/]{2,})",
+                    r"\bB\.N\.?\s*[#:=\s]\s*([A-Z0-9][A-Z0-9\-/]{2,})",
                     r"\bB\.?N\.?O?\.?\s*[#:=]\s*([A-Z0-9][A-Z0-9\-/]{2,})",
-                    r"\bBATCH(?:\s*(?:NO\.?|NUMBER))?\s*[#:=]\s*([A-Z0-9][A-Z0-9\-/]{2,})",
+                    r"\bBATCH(?:\s*(?:NO\.?|NUMBER|CODE))?\s*[#:=.\s]\s*([A-Z0-9][A-Z0-9\-/]{2,})",
                 ),
             )
         if not exp:
             exp = _extract_labeled_value(
                 evidence,
                 (
-                    r"\bEXP(?:IRY)?(?:\s*DATE)?[#:\s.]*([0-9]{1,4}\s*[-/]\s*[0-9]{1,4}(?:\s*[-/]\s*[0-9]{2,4})?)",
-                    r"\bCAD[#:\s.]*([0-9]{1,4}\s*[-/]\s*[0-9]{1,4}(?:\s*[-/]\s*[0-9]{2,4})?)",
+                    r"\bEXP(?:IRY)?(?:\s*DATE\.?)?[#:\s.]*([0-9]{1,4}[\s\-/\.][0-9]{1,4}(?:[\s\-/\.][0-9]{2,4})?)",
+                    r"\bCAD[#:\s.]*([0-9]{1,4}[\s\-/\.][0-9]{1,4}(?:[\s\-/\.][0-9]{2,4})?)",
+                    r"\bUSE\s+BY[#:\s.]*([0-9]{1,4}[\s\-/\.][0-9]{1,4}(?:[\s\-/\.][0-9]{2,4})?)",
                 ),
             )
         if not mfg:
             mfg = _extract_labeled_value(
                 evidence,
                 (
-                    r"\bMFG(?:\.?\s*DATE)?[#:\s.]*([0-9]{1,4}\s*[-/]\s*[0-9]{1,4}(?:\s*[-/]\s*[0-9]{2,4})?)",
-                    r"\bMFD[#:\s.]*([0-9]{1,4}\s*[-/]\s*[0-9]{1,4}(?:\s*[-/]\s*[0-9]{2,4})?)",
-                    r"\bPRO[#:\s.]*([0-9]{1,4}\s*[-/]\s*[0-9]{1,4}(?:\s*[-/]\s*[0-9]{2,4})?)",
+                    r"\bMFG(?:\.?\s*DATE\.?)?[#:\s.]*([0-9]{1,4}[\s\-/\.][0-9]{1,4}(?:[\s\-/\.][0-9]{2,4})?)",
+                    r"\bMFD[#:\s.]*([0-9]{1,4}[\s\-/\.][0-9]{1,4}(?:[\s\-/\.][0-9]{2,4})?)",
+                    r"\bPRO[#:\s.]*([0-9]{1,4}[\s\-/\.][0-9]{1,4}(?:[\s\-/\.][0-9]{2,4})?)",
+                    r"\bDATE\s+OF\s+MANUFACTURE[#:\s.]*([0-9]{1,4}[\s\-/\.][0-9]{1,4}(?:[\s\-/\.][0-9]{2,4})?)",
                 ),
             )
         if not gtin:
@@ -446,15 +503,11 @@ def _call_vision_llm(
         "messages": messages,
         "temperature": 0,
         "top_p": 1,
-        "max_tokens": 2048,
+        "max_tokens": 4096,
         "seed": seed,
         "response_format": {"type": "json_object"},
     }
-    try:
-        completion = client.chat.completions.create(**request)
-    except Exception:
-        request.pop("extra_body", None)
-        completion = client.chat.completions.create(**request)
+    completion = client.chat.completions.create(**request)
     content = completion.choices[0].message.content or "{}"
     try:
         return _parse_llm_json(content)
