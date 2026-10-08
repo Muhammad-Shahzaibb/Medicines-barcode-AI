@@ -17,13 +17,12 @@ st.set_page_config(
 )
 
 st.title("Medicine Barcode Extractor")
-st.caption("Vision AI extraction via Qwen3-VL-32B (vLLM)")
+st.caption("Vision AI extraction via GPT-4.5 (OpenAI)")
 
 with st.sidebar:
     st.header("Settings")
-    llm_base_url = os.getenv("LLM_BASE_URL", "http://101.44.222.84:8000/v1")
-    llm_model = os.getenv("LLM_MODEL") or "(auto from /v1/models)"
-    st.success(f"LLM: {llm_base_url}")
+    llm_model = os.getenv("LLM_MODEL", "gpt-4.5")
+    st.success("LLM: OpenAI API")
     st.caption(f"Model: {llm_model}")
 
 uploaded = st.file_uploader(

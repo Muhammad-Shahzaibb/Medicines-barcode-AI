@@ -15,8 +15,9 @@ from src.gs1_parser import parse_gs1
 from src.models import MedicineRecord
 from src.normalizer import normalize_date, normalize_gtin
 
-DEFAULT_LLM_BASE_URL = "http://101.44.222.84:8000/v1"
-DEFAULT_LLM_API_KEY = "dummy"
+DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_LLM_API_KEY = ""
+DEFAULT_LLM_MODEL = "gpt-4.5"
 DEFAULT_LLM_SEED = 42
 MAX_IMAGE_SIDE = 1536
 NULL_TOKENS = {
@@ -400,7 +401,7 @@ def _record_from_dict(item: dict[str, Any]) -> MedicineRecord:
 def _get_llm_settings() -> tuple[str, str, str | None, int]:
     base_url = os.getenv("LLM_BASE_URL", DEFAULT_LLM_BASE_URL).rstrip("/")
     api_key = os.getenv("LLM_API_KEY", DEFAULT_LLM_API_KEY)
-    model = os.getenv("LLM_MODEL") or None
+    model = os.getenv("LLM_MODEL") or DEFAULT_LLM_MODEL
     seed = int(os.getenv("LLM_SEED", str(DEFAULT_LLM_SEED)))
     return base_url, api_key, model, seed
 
@@ -448,11 +449,6 @@ def _call_vision_llm(
         "max_tokens": 2048,
         "seed": seed,
         "response_format": {"type": "json_object"},
-        "extra_body": {
-            "seed": seed,
-            "top_k": 1,
-            "chat_template_kwargs": {"enable_thinking": False},
-        },
     }
     try:
         completion = client.chat.completions.create(**request)
