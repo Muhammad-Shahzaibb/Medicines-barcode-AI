@@ -13,3 +13,5 @@ venv/
 .coverage
 htmlcov/
 *.log
+
+Priority Test Data/
