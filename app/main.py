@@ -59,19 +59,19 @@ async def extract(file: UploadFile = File(...)):
     return JSONResponse(_dump(await _run(file)))
 
 
-@app.post("/extract/batch", responses={200: {"model": List[ExtractionResponse]}})
-async def extract_batch(files: List[UploadFile] = File(...)):
-    """Extract medicine data from MANY images (processed concurrently)."""
-    results = await asyncio.gather(*[_run(f) for f in files])
-    return JSONResponse([_dump(r) for r in results])
+# @app.post("/extract/batch", responses={200: {"model": List[ExtractionResponse]}})
+# async def extract_batch(files: List[UploadFile] = File(...)):
+#     """Extract medicine data from MANY images (processed concurrently)."""
+#     results = await asyncio.gather(*[_run(f) for f in files])
+#     return JSONResponse([_dump(r) for r in results])
 
 
-@app.post("/ocr/raw")
-async def ocr_raw(file: UploadFile = File(...), angle: int = Query(0)):
-    """Debug helper: returns the plain text PaddleOCR-VL read from the image (no parsing)."""
-    data = await file.read()
-    try:
-        text = await app.state.pipeline.ocr_text(file.filename or "upload", data, angle % 360)
-    except OCRError as e:
-        raise HTTPException(502, str(e))
-    return {"source_image": file.filename, "angle": angle, "text": text}
+# @app.post("/ocr/raw")
+# async def ocr_raw(file: UploadFile = File(...), angle: int = Query(0)):
+#     """Debug helper: returns the plain text PaddleOCR-VL read from the image (no parsing)."""
+#     data = await file.read()
+#     try:
+#         text = await app.state.pipeline.ocr_text(file.filename or "upload", data, angle % 360)
+#     except OCRError as e:
+#         raise HTTPException(502, str(e))
+#     return {"source_image": file.filename, "angle": angle, "text": text}
