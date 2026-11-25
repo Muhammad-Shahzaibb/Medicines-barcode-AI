@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Medicine Label Extractor",
-    description="Extracts GTIN / batch / lot / MFG / EXP / serial from medicine images using PaddleOCR-VL 1.6.",
+    description="Extracts GTIN / batch / lot / MFG / EXP / serial from medicine images using qwen3.8 vision model.",
     version="1.0.0",
     lifespan=lifespan,
 )

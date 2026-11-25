@@ -1,15 +1,18 @@
-"""Async client for the locally deployed PaddleOCR-VL 1.6 endpoint.
+"""Async client for the OpenAI-compatible vision endpoint (qwen3.8).
 
-Equivalent of:
-    curl -X POST $OCR_URL -H "Authorization: Bearer $OCR_TOKEN" -F "file=@image.jpg"
+Sends the image base64-encoded inside an OpenAI chat-completions request:
+    POST $OCR_URL  (e.g. https://101.46.52.232/v2/infer/<uuid>/v1/chat/completions)
+    Authorization: Bearer $OCR_TOKEN
+    { "model": "$OCR_MODEL",
+      "messages": [{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:<mime>;base64,<data>"}},{"type":"text","text":"..."}]}],
+      "max_completion_tokens": $OCR_MAX_TOKENS }
 
-The response schema of the server is not fixed, so ``extract_text`` walks any
-JSON shape (plain text, {"text": ...}, {"markdown": ...}, PaddleX layout
-results, OpenAI-style chat responses, ...) and returns one text blob.
+The assistant reply text is extracted from choices[0].message.content.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,54 +31,43 @@ class OCRResult:
     raw: Any
 
 
-_PRIORITY_KEYS = (
-    "block_content", "markdown", "md_results", "text", "full_text", "rec_texts",
-    "ocr_text", "content", "transcription", "parsing_res_list",
-    "layoutParsingResults", "pages", "results", "result", "data", "output",
-    "blocks", "lines", "choices", "message",
-)
-_SKIP_KEYS = {
-    "bbox", "box", "boxes", "polygon", "points", "image", "images", "img", "score",
-    "scores", "label", "id", "type", "angle", "width", "height", "coordinates",
-    "rec_polys", "rec_boxes", "dt_polys", "rec_scores", "status", "success",
-    "code", "model", "usage", "time", "elapsed",
-}
-
-
-def _walk(obj: Any) -> list[str]:
-    if obj is None:
-        return []
-    if isinstance(obj, str):
-        return [obj]
-    if isinstance(obj, (int, float, bool)):
-        return []
-    if isinstance(obj, list):
-        out: list[str] = []
-        for item in obj:
-            out.extend(_walk(item))
-        return out
-    if isinstance(obj, dict):
-        for key in _PRIORITY_KEYS:
-            if key in obj and obj[key] not in (None, "", [], {}):
-                got = _walk(obj[key])
-                if got:
-                    return got
-        out = []
-        for k, v in obj.items():
-            if k in _SKIP_KEYS:
-                continue
-            out.extend(_walk(v))
-        return out
-    return []
-
-
-def extract_text(payload: Any) -> str:
-    """Flatten whatever the OCR server returned into a single text string."""
+def _extract_chat_text(payload: Any) -> str:
+    """Pull the assistant reply text out of an OpenAI chat-completions response."""
+    if isinstance(payload, str):
+        return payload.strip()
     if isinstance(payload, dict):
         err = payload.get("error")
-        if err and not any(k in payload for k in ("text", "markdown", "result", "results", "data")):
-            raise OCRError(f"OCR server error: {err}")
-    return "\n".join(s.strip("\r") for s in _walk(payload) if s and s.strip())
+        if err:
+            msg = err.get("message", err) if isinstance(err, dict) else err
+            raise OCRError(f"Model error: {msg}")
+        # Standard OpenAI shape: choices[0].message.content
+        choices = payload.get("choices") or []
+        if choices:
+            first = choices[0]
+            if isinstance(first, dict):
+                message = first.get("message") or {}
+                content = message.get("content", "")
+                if isinstance(content, list):
+                    # multi-part content — join text parts
+                    return "\n".join(
+                        p.get("text", "") for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    ).strip()
+                return str(content).strip()
+        # Fallback: any "text" or "content" key at top level
+        for key in ("text", "content", "output", "result"):
+            if key in payload and payload[key]:
+                return str(payload[key]).strip()
+    return str(payload).strip()
+
+
+# Prompt sent with every image — instructs the model to transcribe label text
+_OCR_PROMPT = (
+    "You are an OCR engine. Transcribe ALL text visible in this medicine / medical-device "
+    "label image exactly as printed. Preserve line breaks, numbers, dates, lot/batch codes, "
+    "GTIN barcodes, and serial numbers. Do NOT add explanations or summaries — output only "
+    "the raw transcribed text."
+)
 
 
 class OCRClient:
@@ -92,17 +84,32 @@ class OCRClient:
 
     async def ocr(self, image_bytes: bytes, filename: str = "image.jpg",
                   mime: str = "image/jpeg", retries: int = 2) -> OCRResult:
-        headers = {}
+        headers = {"Content-Type": "application/json"}
         if self.s.ocr_token:
             headers["Authorization"] = f"Bearer {self.s.ocr_token}"
+
+        b64 = base64.b64encode(image_bytes).decode()
+        body = {
+            "model": self.s.ocr_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"},
+                        },
+                        {"type": "text", "text": _OCR_PROMPT},
+                    ],
+                }
+            ],
+            "max_completion_tokens": self.s.ocr_max_tokens,
+        }
+
         last: Exception | None = None
         for attempt in range(retries + 1):
             try:
-                resp = await self._client.post(
-                    self.s.ocr_url,
-                    headers=headers,
-                    files={self.s.ocr_file_field: (filename, image_bytes, mime)},
-                )
+                resp = await self._client.post(self.s.ocr_url, headers=headers, json=body)
                 if resp.status_code in (401, 403):
                     raise OCRError(f"OCR auth failed (HTTP {resp.status_code}) - check OCR_TOKEN")
                 if resp.status_code in (502, 503, 504) and attempt < retries:
@@ -114,7 +121,7 @@ class OCRClient:
                     payload: Any = resp.json()
                 except ValueError:
                     payload = resp.text
-                return OCRResult(text=extract_text(payload), raw=payload)
+                return OCRResult(text=_extract_chat_text(payload), raw=payload)
             except (httpx.TimeoutException, httpx.TransportError) as e:
                 last = e
                 if attempt < retries:
